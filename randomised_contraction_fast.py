@@ -106,6 +106,7 @@ while i > 1:
     LEFT OUTER JOIN R{i+1} AS R ON (L.r = R.v)
     """
 
+    print(f"Iteration {i}: Composing representatives")
     duckdb.execute(compose_query)
 
     duckdb.execute(f"DROP TABLE R{i}")
