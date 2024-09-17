@@ -5,6 +5,8 @@ import duckdb
 import networkx as nx  # For validating answer
 import pandas as pd
 
+random.seed(42)  # Set a fixed seed for reproducibility
+
 
 def ascii_uid(length):
     """Generate a random ASCII string of specified length."""
@@ -23,7 +25,8 @@ def generate_random_edges(num_rows, num_edges):
     for _ in range(num_edges):
         unique_id_l = random.randint(0, num_rows - 1)
         unique_id_r = random.randint(0, num_rows - 1)
-        edges.append({"unique_id_l": unique_id_l, "unique_id_r": unique_id_r})
+        if unique_id_l != unique_id_r:  # Exclude self-loops for initial edges
+            edges.append({"unique_id_l": unique_id_l, "unique_id_r": unique_id_r})
     return pd.DataFrame(edges)
 
 
