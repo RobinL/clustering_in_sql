@@ -1,11 +1,17 @@
 import random
 import string
+import time
 
 import duckdb
 import networkx as nx  # For validating answer
 import pandas as pd
 
+from generate_random_graphs import generate_chain_graph, generate_graph
+
 random.seed(42)  # Set a fixed seed for reproducibility
+
+# This algorith is called Breadth First Search
+# in the paper https://arxiv.org/pdf/1802.09478.pdf
 
 
 def ascii_uid(length):
@@ -13,31 +19,13 @@ def ascii_uid(length):
     return "".join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
-def generate_random_nodes(num_rows):
-    data = []
-    for i in range(num_rows):
-        data.append({"unique_id": i})
-    return pd.DataFrame(data)
-
-
-def generate_random_edges(num_rows, num_edges):
-    edges = []
-    for _ in range(num_edges):
-        unique_id_l = random.randint(0, num_rows - 1)
-        unique_id_r = random.randint(0, num_rows - 1)
-        if unique_id_l != unique_id_r:  # Exclude self-loops for initial edges
-            edges.append({"unique_id_l": unique_id_l, "unique_id_r": unique_id_r})
-    return pd.DataFrame(edges)
-
-
-num_rows = 1000
-num_edges = 2000
-nodes = generate_random_nodes(num_rows)
-edges_without_self_loops = generate_random_edges(num_rows, num_edges)
+nodes, edges_without_self_loops = generate_chain_graph(10000)
 
 # Register the DataFrames with DuckDB
 duckdb.register("nodes", nodes)
 duckdb.register("edges_without_self_loops", edges_without_self_loops)
+
+start_time = time.time()
 
 # Create the edges table, adding self-loops
 sql = """
@@ -129,6 +117,11 @@ ORDER BY cluster_id, unique_id
 """
 our_clusters = duckdb.execute(final_query).fetchdf()
 print(our_clusters)
+
+end_time = time.time()
+execution_time = end_time - start_time
+print(f"Core graph solving algorithm execution time: {execution_time:.2f} seconds")
+
 
 # Validate the clusters using NetworkX
 # Build the graph using NetworkX
