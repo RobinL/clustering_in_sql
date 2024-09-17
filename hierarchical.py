@@ -8,6 +8,43 @@ import pandas as pd
 import generate_random_graphs as gen
 
 
+def validate_with_networkx(nodes, edges_without_self_loops, probability_threshold):
+    G = nx.Graph()
+    G.add_nodes_from(nodes["unique_id"])
+
+    for _, edge in edges_without_self_loops.iterrows():
+        if edge["match_probability"] >= probability_threshold:
+            G.add_edge(edge["unique_id_l"], edge["unique_id_r"])
+
+    connected_components = list(nx.connected_components(G))
+
+    nx_clusters = pd.DataFrame(
+        [
+            {"unique_id": node, "cluster_id": i}
+            for i, component in enumerate(connected_components)
+            for node in component
+        ]
+    )
+    cluster_stats_query = """
+    SELECT
+        COUNT(DISTINCT cluster_id) AS num_clusters,
+        AVG(cluster_size) AS avg_cluster_size
+    FROM (
+        SELECT
+            cluster_id,
+            COUNT(*) AS cluster_size
+        FROM nx_clusters
+        GROUP BY cluster_id
+    )
+    """
+
+    duckdb.register("nx_clusters", nx_clusters)
+
+    print("NetworkX Clustering Results:")
+
+    print(duckdb.sql(cluster_stats_query))
+
+
 def perform_clustering(nodes, edges_without_self_loops, probability_threshold=0.5):
     # Register the DataFrames with DuckDB
     duckdb.register("nodes", nodes)
@@ -78,55 +115,12 @@ def perform_clustering(nodes, edges_without_self_loops, probability_threshold=0.
         duckdb.execute("DROP TABLE representatives")
         duckdb.execute("ALTER TABLE updated_representatives RENAME TO representatives")
 
-    return duckdb.execute("""
+    return duckdb.sql("""
+
     SELECT node_id AS unique_id, representative AS cluster_id
     FROM representatives
     ORDER BY cluster_id, unique_id
-    """).fetchdf()
-
-
-def validate_clustering(
-    nodes, edges_without_self_loops, clusters_to_validate, probability_threshold
-):
-    duckdb.register("nodes", nodes)
-    duckdb.register("edges_without_self_loops", edges_without_self_loops)
-
-    duckdb.execute(f"""
-    CREATE OR REPLACE TABLE edges AS
-    SELECT unique_id_l, unique_id_r
-    FROM edges_without_self_loops
-    WHERE unique_id_l <> unique_id_r
-    AND match_probability >= {probability_threshold}
-    UNION
-    SELECT unique_id, unique_id AS unique_id_r
-    FROM nodes
     """)
-
-    edges_df = duckdb.execute("SELECT unique_id_l, unique_id_r FROM edges").fetchdf()
-    G = nx.Graph()
-    G.add_edges_from(edges_df.values)
-
-    nx_components = list(nx.connected_components(G))
-    nx_cluster_df = pd.DataFrame(
-        [
-            (node, idx)
-            for idx, component in enumerate(nx_components)
-            for node in component
-        ],
-        columns=["unique_id", "nx_cluster_id"],
-    )
-
-    merged_clusters = clusters_to_validate.merge(nx_cluster_df, on="unique_id")
-    grouped_our_clusters = merged_clusters.groupby("cluster_id")[
-        "nx_cluster_id"
-    ].nunique()
-
-    if grouped_our_clusters.eq(1).all():
-        print("Clustering matches with NetworkX connected components.")
-    else:
-        print("Clustering does not match with NetworkX connected components.")
-
-    duckdb.execute("DROP TABLE edges")
 
 
 # Main execution
@@ -135,21 +129,32 @@ def validate_clustering(
 random.seed(42)
 nodes, edges_without_self_loops = gen.generate_uniform_probability_graph(1000, 1000, 42)
 
-start_time = time.time()
-initial_clusters = perform_clustering(nodes, edges_without_self_loops, 0.5)
-end_time = time.time()
 
-duckdb.register("initial_clusters", initial_clusters)
+initial_clusters = perform_clustering(nodes, edges_without_self_loops, 0.5)
+
+cluster_stats_query = """
+    SELECT
+        COUNT(DISTINCT cluster_id) AS num_clusters,
+        AVG(cluster_size) AS avg_cluster_size
+    FROM (
+        SELECT
+            cluster_id,
+            COUNT(*) AS cluster_size
+        FROM initial_clusters
+        GROUP BY cluster_id
+    )
+    """
+print(duckdb.sql(cluster_stats_query))
+
 
 print("initial_clusters")
 print(duckdb.sql("select * from initial_clusters"))
 print(duckdb.sql("select count(distinct cluster_id) from initial_clusters"))
 
-# Look at the edges associated with each cluster
-# Where all the edges are greater than the next threshold, it's a stable cluster
+NEW_THRESHOLD = 0.55
 
 
-sql = """
+sql = f"""
 create or replace table stable_clusters as
 with edges as (
 select * from edges_without_self_loops
@@ -170,7 +175,7 @@ SELECT
 FROM edges_with_clusters
 WHERE cluster_id_l = cluster_id_r
 GROUP BY cluster_id_l
-HAVING MIN(match_probability) > 0.51
+HAVING MIN(match_probability) > {NEW_THRESHOLD}
 ORDER BY cluster_id_l
 """
 
@@ -217,10 +222,11 @@ print(duckdb.sql(sql))
 nodes_in_play = duckdb.sql("select * from nodes_in_play").df()
 edges_in_play = duckdb.sql("select * from edges_in_play").df()
 
-new_clusters = perform_clustering(nodes_in_play, edges_in_play, 0.51)
+new_clusters = perform_clustering(nodes_in_play, edges_in_play, NEW_THRESHOLD)
 
 # Finally append the new clusters to the stable clusters
 final_result = duckdb.sql("""
+create or replace table final_result as
 with final_result as (
 SELECT * FROM stable_nodes
 UNION ALL
@@ -228,8 +234,20 @@ SELECT * FROM new_clusters
            )
            select * from final_result
            order by unique_id, cluster_id
-""").df()
+""")
 
+cluster_stats_query = """
+    SELECT
+        COUNT(DISTINCT cluster_id) AS num_clusters,
+        AVG(cluster_size) AS avg_cluster_size
+    FROM (
+        SELECT
+            cluster_id,
+            COUNT(*) AS cluster_size
+        FROM final_result
+        GROUP BY cluster_id
+    )
+    """
+print(duckdb.sql(cluster_stats_query))
 # Validate the clusters using NetworkX
-
-validate_clustering(nodes, edges_without_self_loops, final_result, 0.51)
+validate_with_networkx(nodes, edges_without_self_loops, NEW_THRESHOLD)
