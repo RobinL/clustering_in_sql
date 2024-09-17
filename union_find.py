@@ -6,7 +6,7 @@ import duckdb
 import networkx as nx  # For validating answer
 import pandas as pd
 
-from generate_random_graphs import generate_chain_graph, generate_graph
+import generate_random_graphs as gen
 
 random.seed(42)  # Set a fixed seed for reproducibility
 
@@ -19,7 +19,7 @@ def ascii_uid(length):
     return "".join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
-nodes, edges_without_self_loops = generate_chain_graph(10000)
+nodes, edges_without_self_loops = gen.generate_chain_graph(10000)
 
 # Register the DataFrames with DuckDB
 duckdb.register("nodes", nodes)
