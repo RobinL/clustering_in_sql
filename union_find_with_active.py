@@ -21,7 +21,7 @@ ddb_con = duckdb.connect()
 # )
 #
 nodes, edges_without_self_loops = gen.generate_uniform_probability_graph(
-    int(2e5), int(4e5), random.randint(0, 1000000)
+    int(1e5), int(2e5), random.randint(0, 1000000)
 )
 
 # Register the DataFrames with DuckDB
