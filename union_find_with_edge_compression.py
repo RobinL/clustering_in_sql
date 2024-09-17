@@ -2,6 +2,7 @@ import random
 import string
 
 import duckdb
+import networkx as nx  # For validating answer
 import pandas as pd
 
 
@@ -26,28 +27,25 @@ def generate_random_edges(num_rows, num_edges):
     return pd.DataFrame(edges)
 
 
-num_rows = 200
-num_edges = 100
+num_rows = 1000
+num_edges = 2000
 nodes = generate_random_nodes(num_rows)
 edges_without_self_loops = generate_random_edges(num_rows, num_edges)
 
 
-# Create a DuckDB connection
-conn = duckdb.connect()
-
 # Register the DataFrames with DuckDB
-conn.register("nodes", nodes)
-conn.register("edges_without_self_loops", edges_without_self_loops)
+duckdb.register("nodes", nodes)
+duckdb.register("edges_without_self_loops", edges_without_self_loops)
 
 sql = """
-create table edges as
-select unique_id_l, unique_id_r
-from edges_without_self_loops
-union
-select unique_id as unique_id_l, unique_id as unique_id_r
-from nodes
+CREATE OR REPLACE TABLE edges AS
+SELECT unique_id_l, unique_id_r
+FROM edges_without_self_loops
+UNION
+SELECT unique_id AS unique_id_l, unique_id AS unique_id_r
+FROM nodes
 """
-conn.execute(sql)
+duckdb.execute(sql)
 
 # Create a temporary table for valid edges (ensure bidirectional edges)
 create_valid_edges_query = """
@@ -58,7 +56,7 @@ UNION
 SELECT unique_id_r AS unique_id_l, unique_id_l AS unique_id_r
 FROM edges;
 """
-conn.execute(create_valid_edges_query)
+duckdb.execute(create_valid_edges_query)
 
 # Initialize the first UnionFind table with each node as its own parent
 initial_unionfind_table = f"UnionFind_{ascii_uid(8)}"
@@ -67,7 +65,7 @@ CREATE TABLE {initial_unionfind_table} AS
 SELECT unique_id AS node, unique_id AS parent
 FROM nodes;
 """
-conn.execute(init_query)
+duckdb.execute(init_query)
 
 # Keep track of the current UnionFind table
 current_unionfind = initial_unionfind_table
@@ -77,7 +75,6 @@ changes = 1
 
 while changes > 0:
     iteration += 1
-    print(f"\n--- Iteration {iteration} ---")
 
     # Generate a unique name for the new UnionFind table
     new_unionfind_table = f"UnionFind_{ascii_uid(8)}"
@@ -93,7 +90,7 @@ while changes > 0:
     JOIN {current_unionfind} uf2 ON e.unique_id_l = uf2.node
     GROUP BY uf.node;
     """
-    conn.execute(union_step_query)
+    duckdb.execute(union_step_query)
 
     # Path Compression Step: Update parent to the parent's parent
     path_compression_table = f"UnionFind_{ascii_uid(8)}"
@@ -108,12 +105,14 @@ while changes > 0:
     FROM {new_unionfind_table} u
     LEFT JOIN {new_unionfind_table} u2 ON u.parent = u2.node;
     """
-    conn.execute(path_compression_query)
+    duckdb.execute(path_compression_query)
 
     # Compare the new table with the current to count changes
     # Fetch the current and new parents
-    current_df = conn.execute(f"SELECT node, parent FROM {current_unionfind}").fetchdf()
-    new_df = conn.execute(
+    current_df = duckdb.execute(
+        f"SELECT node, parent FROM {current_unionfind}"
+    ).fetchdf()
+    new_df = duckdb.execute(
         f"SELECT node, parent FROM {path_compression_table}"
     ).fetchdf()
 
@@ -122,7 +121,7 @@ while changes > 0:
 
     # Count how many parents have changed
     changes = (merged_df["parent_old"] != merged_df["parent_new"]).sum()
-    print(f"Changed rows count: {changes}")
+    print(f"Iteration {iteration}: Changed rows count: {changes}")
 
     if changes == 0:
         # No changes; the algorithm has converged
@@ -133,11 +132,41 @@ while changes > 0:
         # Update the current_unionfind to the new table for the next iteration
         current_unionfind = path_compression_table
 
+
 # Final clustering results
 final_query = f"""
 SELECT node AS unique_id, parent AS cluster_id
 FROM {final_unionfind_table}
 ORDER BY cluster_id, node;
 """
-our_clusters = conn.execute(final_query).fetchdf()
+our_clusters = duckdb.execute(final_query).fetchdf()
 print(our_clusters)
+
+
+final_query = f"""
+SELECT node AS unique_id, parent AS cluster_id
+FROM {final_unionfind_table}
+ORDER BY cluster_id, node;
+"""
+our_clusters = duckdb.execute(final_query).fetchdf()
+
+
+G = nx.Graph()
+edges_df = duckdb.execute("SELECT unique_id_l, unique_id_r FROM edges").fetchdf()
+G.add_edges_from(edges_df.values)
+
+nx_clusters = list(nx.connected_components(G))
+
+# Convert NetworkX clusters to a DataFrame
+nx_cluster_df = pd.DataFrame(
+    [(node, i) for i, cluster in enumerate(nx_clusters) for node in cluster],
+    columns=["unique_id", "nx_cluster_id"],
+)
+
+# Merge our clusters with NetworkX clusters
+merged_clusters = our_clusters.merge(nx_cluster_df, on="unique_id")
+
+# Check if the clusterings match
+assert (
+    merged_clusters.groupby("cluster_id")["nx_cluster_id"].nunique().eq(1).all()
+), "Clustering mismatch detected"
