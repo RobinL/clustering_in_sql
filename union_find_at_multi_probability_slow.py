@@ -27,14 +27,13 @@ duckdb.register("edges", edges)
 
 # Dictionary to store representatives at each threshold
 representatives_dict = {}
-
 total_start_time = time.time()
 # Start with the lowest threshold
 for idx, THRESHOLD_PROBABILITY in enumerate(THRESHOLDS):
     print(f"\nProcessing threshold: {THRESHOLD_PROBABILITY}")
     start_time = time.time()
 
-    # Create the edges table, adding self-loops and filtering by threshold probability
+    # Create the filtered edges table
     filtered_edges_table = f"filtered_edges_{idx}"
     sql = f"""
     CREATE OR REPLACE TABLE {filtered_edges_table} AS
@@ -63,22 +62,12 @@ for idx, THRESHOLD_PROBABILITY in enumerate(THRESHOLDS):
 
     # Initialize the representatives
     representatives_table = f"representatives_{idx}"
-    if idx == 0:
-        # For the first threshold, initialize representatives as the minimum neighbor
-        initial_representatives_query = f"""
-        CREATE OR REPLACE TABLE {representatives_table} AS
-        SELECT node_id, MIN(neighbour) AS representative
-        FROM {neighbours_table}
-        GROUP BY node_id
-        """
-    else:
-        # For higher thresholds, start with the representatives from the previous threshold
-        prev_representatives_table = f"representatives_{idx - 1}"
-        initial_representatives_query = f"""
-        CREATE OR REPLACE TABLE {representatives_table} AS
-        SELECT r.node_id, r.representative
-        FROM {prev_representatives_table} AS r
-        """
+    initial_representatives_query = f"""
+    CREATE OR REPLACE TABLE {representatives_table} AS
+    SELECT node_id, MIN(neighbour) AS representative
+    FROM {neighbours_table}
+    GROUP BY node_id
+    """
     duckdb.execute(initial_representatives_query)
 
     iteration = 0
@@ -163,7 +152,7 @@ print("\nFinal Clustering Results:")
 print(final_df.head().to_markdown(index=False))
 
 
-# Validate the clusters for each threshold
+# # Validate the clusters for each threshold
 # for THRESHOLD_PROBABILITY in THRESHOLDS:
 #     print(f"\nValidating clustering for threshold: {THRESHOLD_PROBABILITY}")
 
