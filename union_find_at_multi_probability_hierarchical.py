@@ -1,263 +1,272 @@
-# THIS CURRENT EXECUTES BUT DOESN'T REALLY ACHIEVE THE
-# AIM OF USING THE EXISTING CLUSTERS TO MAKE IT FASTER
-
 import random
-import string
 import time
 
 import duckdb
+import networkx as nx
 import pandas as pd
 
 import generate_random_graphs as gen
 
-random.seed(42)  # Set a fixed seed for reproducibility
 
-# Define the thresholds
-THRESHOLDS = list([i / 100 for i in range(0, 100, 5)])
+def validate_with_networkx(nodes, edges_without_self_loops, probability_threshold):
+    G = nx.Graph()
+    G.add_nodes_from(nodes["unique_id"])
 
+    for _, edge in edges_without_self_loops.iterrows():
+        if edge["match_probability"] >= probability_threshold:
+            G.add_edge(edge["unique_id_l"], edge["unique_id_r"])
 
-def ascii_uid(length):
-    """Generate a random ASCII string of specified length."""
-    return "".join(random.choices(string.ascii_letters + string.digits, k=length))
+    connected_components = list(nx.connected_components(G))
 
-
-nodes, edges = gen.generate_uniform_probability_graph(100000, 400000, 42)
-
-# Register the DataFrames with DuckDB
-duckdb.register("nodes", nodes)
-duckdb.register("edges", edges)
-
-# Dictionary to store representatives at each threshold
-representatives_dict = {}
-
-total_start_time = time.time()
-# Start with the lowest threshold
-for idx, THRESHOLD_PROBABILITY in enumerate(THRESHOLDS):
-    print(f"\nProcessing threshold: {THRESHOLD_PROBABILITY}")
-    start_time = time.time()
-
-    if idx == 0:
-        # For the first threshold, no cluster constraint
-        # Create the filtered edges table, adding self-loops and filtering by threshold probability
-        filtered_edges_table = f"filtered_edges_{idx}"
-        sql = f"""
-        CREATE OR REPLACE TABLE {filtered_edges_table} AS
+    nx_clusters = pd.DataFrame(
+        [
+            {"unique_id": node, "cluster_id": i}
+            for i, component in enumerate(connected_components)
+            for node in component
+        ]
+    )
+    cluster_stats_query = """
+    SELECT
+        COUNT(DISTINCT cluster_id) AS num_clusters,
+        AVG(cluster_size) AS avg_cluster_size
+    FROM (
         SELECT
-            e.unique_id_l,
-            e.unique_id_r
-        FROM edges AS e
-        WHERE e.unique_id_l <> e.unique_id_r
-          AND e.match_probability >= {THRESHOLD_PROBABILITY}
+            cluster_id,
+            COUNT(*) AS cluster_size
+        FROM nx_clusters
+        GROUP BY cluster_id
+    )
+    """
 
-        UNION
+    duckdb.register("nx_clusters", nx_clusters)
 
-        SELECT unique_id AS unique_id_l, unique_id AS unique_id_r
-        FROM nodes
-        """
-        duckdb.execute(sql)
+    print("NetworkX Clustering Results:")
 
-        # Build the neighbours table without cluster_id
-        neighbours_table = f"neighbours_{idx}"
-        create_neighbours_query = f"""
-        CREATE OR REPLACE TABLE {neighbours_table} AS
-        SELECT unique_id_l AS node_id, unique_id_r AS neighbour
-        FROM {filtered_edges_table}
+    print(duckdb.sql(cluster_stats_query))
 
-        UNION ALL
 
-        SELECT unique_id_r AS node_id, unique_id_l AS neighbour
-        FROM {filtered_edges_table}
-        """
-        duckdb.execute(create_neighbours_query)
+def perform_clustering(nodes, edges_without_self_loops, probability_threshold):
+    duckdb.register("nodes_within_fn", nodes)
+    duckdb.register("edges_without_self_loops_within_fn", edges_without_self_loops)
 
-        # Initialize the representatives: min of neighbor
-        representatives_table = f"representatives_{idx}"
-        initial_representatives_query = f"""
-        CREATE OR REPLACE TABLE {representatives_table} AS
-        SELECT node_id, MIN(neighbour) AS representative
-        FROM {neighbours_table}
-        GROUP BY node_id
-        """
-        duckdb.execute(initial_representatives_query)
-    else:
-        # For higher thresholds, constrain edges to be within the same cluster
-        # The representatives from the previous threshold
-        prev_representatives_table = f"representatives_{idx - 1}"
+    duckdb.execute(f"""
+    CREATE OR REPLACE TABLE edges AS
+    SELECT unique_id_l, unique_id_r
+    FROM edges_without_self_loops_within_fn
+    WHERE unique_id_l <> unique_id_r
+    AND match_probability >= {probability_threshold}
+    UNION
+    SELECT unique_id, unique_id AS unique_id_r
+    FROM nodes_within_fn
+    """)
 
-        # Create the filtered edges table, adding self-loops, and filtering by threshold probability
-        filtered_edges_table = f"filtered_edges_{idx}"
-        sql = f"""
-        CREATE OR REPLACE TABLE {filtered_edges_table} AS
-        SELECT
-            e.unique_id_l,
-            e.unique_id_r,
-            r_l.cluster_id
-        FROM edges AS e
-        JOIN {prev_representatives_table} AS r_l ON e.unique_id_l = r_l.node_id
-        JOIN {prev_representatives_table} AS r_r ON e.unique_id_r = r_r.node_id
-        WHERE e.unique_id_l <> e.unique_id_r
-          AND e.match_probability >= {THRESHOLD_PROBABILITY}
-          AND r_l.cluster_id = r_r.cluster_id
+    # Build the neighbours table
+    duckdb.execute("""
+    CREATE OR REPLACE TABLE neighbours AS
+    SELECT unique_id_l AS node_id, unique_id_r AS neighbour
+    FROM edges
+    UNION ALL
+    SELECT unique_id_r AS node_id, unique_id_l AS neighbour
+    FROM edges
+    """)
 
-        UNION
-
-        SELECT n.unique_id AS unique_id_l, n.unique_id AS unique_id_r, r.cluster_id
-        FROM nodes AS n
-        JOIN {prev_representatives_table} AS r ON n.unique_id = r.node_id
-        """
-        duckdb.execute(sql)
-
-        # Build the neighbours table with cluster_id
-        neighbours_table = f"neighbours_{idx}"
-        create_neighbours_query = f"""
-        CREATE OR REPLACE TABLE {neighbours_table} AS
-        SELECT unique_id_l AS node_id, unique_id_r AS neighbour, cluster_id
-        FROM {filtered_edges_table}
-
-        UNION ALL
-
-        SELECT unique_id_r AS node_id, unique_id_l AS neighbour, cluster_id
-        FROM {filtered_edges_table}
-        """
-        duckdb.execute(create_neighbours_query)
-
-        # Initialize the representatives
-        representatives_table = f"representatives_{idx}"
-        initial_representatives_query = f"""
-        CREATE OR REPLACE TABLE {representatives_table} AS
-        SELECT node_id, MIN(neighbour) AS representative, cluster_id
-        FROM {neighbours_table}
-        GROUP BY node_id, cluster_id
-        """
-        duckdb.execute(initial_representatives_query)
+    # Initialize the representatives
+    duckdb.execute("""
+    CREATE OR REPLACE TABLE representatives AS
+    SELECT node_id, MIN(neighbour) AS representative
+    FROM neighbours
+    GROUP BY node_id
+    """)
 
     iteration = 0
-    changes = 1  # To enter the loop
+    changes = 1
 
     while changes > 0:
         iteration += 1
 
-        if idx == 0:
-            # Update representatives by taking min of representatives of neighbors
-            updated_representatives_table = f"updated_representatives_{idx}"
-            update_query = f"""
-            CREATE OR REPLACE TABLE {updated_representatives_table} AS
-            SELECT
-                n.node_id,
-                MIN(r2.representative) AS representative
-            FROM {neighbours_table} AS n
-            LEFT JOIN {representatives_table} AS r2
-            ON n.neighbour = r2.node_id
-            GROUP BY n.node_id
-            """
-            duckdb.execute(update_query)
-
-            # Compare the updated representatives with the current ones
-            changes_query = f"""
-            SELECT COUNT(*) AS changes
-            FROM (
-                SELECT
-                    r.node_id,
-                    r.representative AS old_representative,
-                    u.representative AS new_representative
-                FROM {representatives_table} AS r
-                JOIN {updated_representatives_table} AS u
-                ON r.node_id = u.node_id
-                WHERE r.representative <> u.representative
-            ) AS diff
-            """
-            changes_result = duckdb.execute(changes_query).fetchone()
-            changes = changes_result[0]
-            print(
-                f"Iteration {iteration}: Number of nodes with changed representative: {changes}"
-            )
-
-            # Replace the old representatives with the updated ones
-            duckdb.execute(f"DROP TABLE {representatives_table}")
-            duckdb.execute(
-                f"ALTER TABLE {updated_representatives_table} RENAME TO {representatives_table}"
-            )
-        else:
-            # Update representatives by taking min of representatives of neighbors within the same cluster
-            updated_representatives_table = f"updated_representatives_{idx}"
-            update_query = f"""
-            CREATE OR REPLACE TABLE {updated_representatives_table} AS
-            SELECT
-                n.node_id,
-                MIN(r2.representative) AS representative,
-                n.cluster_id
-            FROM {neighbours_table} AS n
-            LEFT JOIN {representatives_table} AS r2
-            ON n.neighbour = r2.node_id AND n.cluster_id = r2.cluster_id
-            GROUP BY n.node_id, n.cluster_id
-            """
-            duckdb.execute(update_query)
-
-            # Compare the updated representatives with the current ones
-            changes_query = f"""
-            SELECT COUNT(*) AS changes
-            FROM (
-                SELECT
-                    r.node_id,
-                    r.representative AS old_representative,
-                    u.representative AS new_representative
-                FROM {representatives_table} AS r
-                JOIN {updated_representatives_table} AS u
-                ON r.node_id = u.node_id AND r.cluster_id = u.cluster_id
-                WHERE r.representative <> u.representative
-            ) AS diff
-            """
-            changes_result = duckdb.execute(changes_query).fetchone()
-            changes = changes_result[0]
-            print(
-                f"Iteration {iteration}: Number of nodes with changed representative: {changes}"
-            )
-
-            # Replace the old representatives with the updated ones
-            duckdb.execute(f"DROP TABLE {representatives_table}")
-            duckdb.execute(
-                f"ALTER TABLE {updated_representatives_table} RENAME TO {representatives_table}"
-            )
-
-    # After iterations, ensure representatives_table has cluster_id
-    if idx == 0:
-        # Add cluster_id column by setting it equal to the representative
-        duckdb.execute(f"""
-        CREATE OR REPLACE TABLE {representatives_table} AS
-        SELECT node_id, representative, representative AS cluster_id
-        FROM {representatives_table}
+        duckdb.execute("""
+        CREATE OR REPLACE TABLE updated_representatives AS
+        SELECT
+            n.node_id,
+            MIN(r2.representative) AS representative
+        FROM neighbours AS n
+        LEFT JOIN representatives AS r2
+        ON n.neighbour = r2.node_id
+        GROUP BY n.node_id
         """)
 
-    # Store the final representatives for this threshold
-    final_representatives_query = f"""
-    SELECT node_id AS unique_id, representative AS representative, cluster_id
-    FROM {representatives_table}
-    ORDER BY unique_id
-    """
-    representatives_df = duckdb.execute(final_representatives_query).fetchdf()
-    representatives_dict[THRESHOLD_PROBABILITY] = representatives_df
-    print(
-        f"Completed threshold {THRESHOLD_PROBABILITY} in {time.time() - start_time:.2f} seconds."
+        changes = duckdb.execute("""
+        SELECT COUNT(*) AS changes
+        FROM (
+            SELECT r.node_id
+            FROM representatives AS r
+            JOIN updated_representatives AS u
+            ON r.node_id = u.node_id
+            WHERE r.representative <> u.representative
+        ) AS diff
+        """).fetchone()[0]
+
+        print(
+            f"Iteration {iteration}: Number of nodes with changed representative: {changes}"
+        )
+
+        duckdb.execute("DROP TABLE representatives")
+        duckdb.execute("ALTER TABLE updated_representatives RENAME TO representatives")
+
+    result = duckdb.sql("""
+    SELECT node_id AS unique_id, representative AS cluster_id
+    FROM representatives
+    ORDER BY cluster_id, unique_id
+    """)
+
+    return result
+
+
+# Main execution
+
+OLD_THRESHOLD = 0.5
+random.seed(42)
+nodes_pd, edges_without_self_loops_pd = gen.generate_uniform_probability_graph(
+    1000, 1000, 43
+)
+
+duckdb.execute("create or replace table nodes as select * from nodes_pd")
+duckdb.execute(
+    "create or replace table edges_without_self_loops as select * from edges_without_self_loops_pd"
+)
+
+nodes = duckdb.table("nodes")
+edges_without_self_loops = duckdb.table("edges_without_self_loops")
+
+initial_clusters_pyrelation = perform_clustering(
+    nodes, edges_without_self_loops, OLD_THRESHOLD
+)
+sql = """
+create or replace table initial_clusters as
+select * from initial_clusters_pyrelation
+"""
+duckdb.execute(sql)
+
+
+validate_with_networkx(
+    nodes_pd, edges_without_self_loops_pd, probability_threshold=OLD_THRESHOLD
+)
+
+
+NEW_THRESHOLD = 0.51
+
+
+sql = f"""
+create or replace table stable_clusters as
+with edges as (
+select * from edges_without_self_loops
+union all
+select unique_id as unique_id_l, unique_id as unique_id_r, 1.0 as match_probability
+from nodes
+),
+edges_with_clusters AS (
+    SELECT e.*,
+           cl.cluster_id AS cluster_id_l,
+           cr.cluster_id AS cluster_id_r
+    FROM edges e
+    LEFT JOIN initial_clusters cl ON e.unique_id_l = cl.unique_id
+    LEFT JOIN initial_clusters cr ON e.unique_id_r = cr.unique_id
+
+)
+SELECT
+   cluster_id_l as cluster_id, min(match_probability) as min_match_probability
+FROM edges_with_clusters
+WHERE match_probability >= {OLD_THRESHOLD}
+GROUP BY cluster_id_l
+HAVING MIN(match_probability) >= {NEW_THRESHOLD}
+ORDER BY cluster_id_l
+"""
+
+duckdb.execute(sql)
+
+
+# Now we want a table called stable_nodes which has all the nodes that are in stable_clusters
+sql = """
+create or replace table stable_nodes as
+SELECT *
+FROM initial_clusters ic
+where ic.cluster_id in (
+    select cluster_id from stable_clusters
     )
+"""
+duckdb.execute(sql)
 
-total_end_time = time.time()
-total_execution_time = total_end_time - total_start_time
-print(f"Total execution time: {total_execution_time:.2f} seconds")
 
-# Combine the results into a single DataFrame
-final_df = representatives_dict[THRESHOLDS[-1]][["unique_id"]]
-for THRESHOLD_PROBABILITY in reversed(THRESHOLDS):
-    col_name = f"cluster_id_at_{str(THRESHOLD_PROBABILITY).replace('.', '_')}"
-    df = representatives_dict[THRESHOLD_PROBABILITY][["unique_id", "cluster_id"]]
-    df.rename(columns={"cluster_id": col_name}, inplace=True)
-    final_df = final_df.merge(df, on="unique_id")
+sql = """
+create or replace table edges_in_play as
+with edges as (
+select * from edges_without_self_loops
+union all
+select unique_id as unique_id_l, unique_id as unique_id_r, 1.0 as match_probability
+from nodes
+)
+select * from edges
+where unique_id_l not in (select unique_id from stable_nodes)
+and unique_id_r not in (select unique_id from stable_nodes)
+"""
+duckdb.execute(sql)
 
-# Reorder the columns as per the requirement
-final_columns = ["unique_id"] + [
-    f"cluster_id_at_{str(t).replace('.', '_')}" for t in reversed(THRESHOLDS)
-]
-final_df = final_df[final_columns]
+# nodes still in play
+sql = """
+create or replace table nodes_in_play as
+select * from nodes
+where unique_id not in (select unique_id from stable_nodes)
+"""
+duckdb.execute(sql)
 
-# Display the head of the final DataFrame
-print("\nFinal Clustering Results:")
-print(final_df.head().to_markdown(index=False))
+
+# Finally recluster the nodes in play
+duckdb.sql("select * from nodes_in_play")
+
+
+edges_in_play = duckdb.table("edges_in_play")
+nodes_in_play = duckdb.table("nodes_in_play")
+
+print(f"edges_in_play count: {edges_in_play.count('*').fetchone()[0]}")
+print(f"nodes_in_play count: {nodes_in_play.count('*').fetchone()[0]}")
+
+new_clusters = perform_clustering(nodes_in_play, edges_in_play, NEW_THRESHOLD)
+
+# Finally append the new clusters to the stable clusters
+sql = """
+CREATE OR REPLACE TABLE final_result AS
+WITH final_result AS (
+    SELECT * FROM stable_nodes
+    UNION ALL
+    SELECT * FROM new_clusters
+)
+SELECT * FROM final_result
+ORDER BY unique_id, cluster_id
+"""
+
+final_result = duckdb.sql(sql)
+final_result
+
+# Verify that the edges do have the 'edge case'
+# sql = """
+# WITH cluster_155 AS (
+#     SELECT cluster_id
+#     FROM initial_clusters
+#     WHERE unique_id = 155
+# ),
+# ids_155 AS (
+#     SELECT unique_id
+#     FROM initial_clusters
+#     WHERE cluster_id in (select cluster_id from cluster_155)
+# ),
+# edges_155 AS (
+#     SELECT e.*
+#     FROM edges_without_self_loops e
+#     where e.unique_id_l in (select unique_id from ids_155)
+#     or e.unique_id_r in (select unique_id from ids_155)
+
+# )
+# SELECT * FROM edges_155
+# ORDER BY match_probability DESC
+# """
+# print(duckdb.sql(sql))
