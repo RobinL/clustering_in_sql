@@ -1,5 +1,4 @@
 import random
-import time
 
 import duckdb
 import networkx as nx
@@ -247,6 +246,24 @@ ORDER BY unique_id, cluster_id
 final_result = duckdb.sql(sql)
 final_result
 
+validate_with_networkx(
+    nodes_pd, edges_without_self_loops_pd, probability_threshold=NEW_THRESHOLD
+)
+
+cluster_stats_query = """
+SELECT
+    COUNT(DISTINCT cluster_id) AS num_clusters,
+    AVG(cluster_size) AS avg_cluster_size
+FROM (
+    SELECT
+        cluster_id,
+        COUNT(*) AS cluster_size
+    FROM final_result
+    GROUP BY cluster_id
+)
+    """
+
+print(duckdb.sql(cluster_stats_query))
 # Verify that the edges do have the 'edge case'
 # sql = """
 # WITH cluster_155 AS (
