@@ -1,3 +1,4 @@
+import logging
 import random
 import string
 import time
@@ -15,17 +16,12 @@ ddb_con = duckdb.connect()
 # in the paper https://arxiv.org/pdf/1802.09478.pdf
 
 
-def ascii_uid(length):
-    """Generate a random ASCII string of specified length."""
-    return "".join(random.choices(string.ascii_letters + string.digits, k=length))
-
-
 # nodes, edges_without_self_loops = gen.generate_uniform_probability_graph(
 #     int(2e6), int(8e6), 42
 # )
 #
 nodes, edges_without_self_loops = gen.generate_uniform_probability_graph(
-    int(1e4), int(4e4), random.randint(0, 1000000)
+    int(2e5), int(4e5), random.randint(0, 1000000)
 )
 
 # Register the DataFrames with DuckDB
@@ -73,6 +69,7 @@ iteration = 0
 changes = 1  # To enter the loop
 
 while changes > 0:
+    iteration_start_time = time.time()
     iteration += 1
 
     update_query = """
@@ -80,18 +77,28 @@ while changes > 0:
     SELECT
         n.node_id,
         MIN(r2.representative) AS representative,
-        CASE WHEN MIN(r2.representative) = r1.representative THEN FALSE ELSE TRUE END AS active
+        CASE
+            WHEN MIN(r2.representative) <> MIN(r1.representative) THEN TRUE
+            ELSE FALSE
+        END AS active
     FROM neighbours AS n
     JOIN representatives AS r1 ON n.node_id = r1.node_id
     JOIN representatives AS r2 ON n.neighbour = r2.node_id
-    WHERE r1.active = TRUE
-    GROUP BY n.node_id, r1.representative
+    WHERE r1.active = TRUE OR r2.active = TRUE
+    GROUP BY n.node_id
 
     UNION ALL
 
-    SELECT node_id, representative, FALSE AS active
-    FROM representatives
-    WHERE active = FALSE
+    SELECT r.node_id, r.representative, r.active
+    FROM representatives AS r
+    WHERE r.node_id NOT IN (
+        SELECT n.node_id
+        FROM neighbours AS n
+        JOIN representatives AS r1 ON n.node_id = r1.node_id
+        JOIN representatives AS r2 ON n.neighbour = r2.node_id
+        WHERE r1.active = TRUE OR r2.active = TRUE
+        GROUP BY n.node_id
+    )
     """
     ddb_con.execute(update_query)
 
@@ -102,10 +109,15 @@ while changes > 0:
     """
     changes_result = ddb_con.execute(changes_query).fetchone()
     changes = changes_result[0]
-    print(f"Iteration {iteration}: Number of active nodes: {changes}")
 
     ddb_con.execute("DROP TABLE representatives")
     ddb_con.execute("ALTER TABLE updated_representatives RENAME TO representatives")
+
+    iteration_end_time = time.time()
+    iteration_time = iteration_end_time - iteration_start_time
+    print(
+        f"Iteration {iteration}: Number of active nodes: {changes}, Time taken: {iteration_time:.2f} seconds"
+    )
 
 # Final clustering results
 final_query = """
@@ -139,21 +151,6 @@ nx_cluster_df = pd.DataFrame(
     [(node, idx) for idx, component in enumerate(nx_components) for node in component],
     columns=["unique_id", "nx_cluster_id"],
 )
-
-# Check the answer against Splink's connected components
-nx_cluster_df
-
-db_api = DuckDBAPI(ddb_con)
-settings_creator = SettingsCreator(link_type="dedupe_only")
-linker = Linker(nodes, settings_creator, db_api)
-
-predict_splink_df = linker.table_management.register_table_predict(
-    edges_without_self_loops
-)
-clusters = linker.clustering.cluster_pairwise_predictions_at_threshold(
-    predict_splink_df, threshold_match_probability=0.5
-)
-splink_clusters = clusters.as_pandas_dataframe()
 
 
 cluster_stats_query = """
@@ -193,6 +190,21 @@ print("NX Cluster Statistics:")
 print(our_cluster_stats)
 
 # Calculate cluster statistics for Splink's method
+
+db_api = DuckDBAPI(ddb_con)
+settings_creator = SettingsCreator(link_type="dedupe_only")
+linker = Linker(nodes, settings_creator, db_api)
+
+predict_splink_df = linker.table_management.register_table_predict(
+    edges_without_self_loops
+)
+logging.getLogger("splink").setLevel(15)
+clusters = linker.clustering.cluster_pairwise_predictions_at_threshold(
+    predict_splink_df, threshold_match_probability=0.5
+)
+splink_clusters = clusters.as_pandas_dataframe()
+
+
 splink_cluster_stats_query = """
 SELECT
     COUNT(DISTINCT cluster_id) AS num_clusters,
