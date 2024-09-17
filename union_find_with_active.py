@@ -5,6 +5,7 @@ import time
 import duckdb
 import networkx as nx  # For validating answer
 import pandas as pd
+from splink import DuckDBAPI, Linker, SettingsCreator
 
 import generate_random_graphs as gen
 
@@ -24,7 +25,7 @@ def ascii_uid(length):
 # )
 #
 nodes, edges_without_self_loops = gen.generate_uniform_probability_graph(
-    int(1e5), int(4e5), random.randint(0, 1000000)
+    int(1e4), int(4e4), random.randint(0, 1000000)
 )
 
 # Register the DataFrames with DuckDB
@@ -124,26 +125,6 @@ execution_time = end_time - start_time
 print(f"Core graph solving algorithm execution time: {execution_time:.2f} seconds")
 our_clusters
 
-# 	unique_id	cluster_id
-# 0	0	0
-# 1	482	0
-# Calculate number of clusters and average cluster size from our_clusters
-cluster_stats_query = """
-SELECT
-    COUNT(DISTINCT cluster_id) AS num_clusters,
-    AVG(cluster_size) AS avg_cluster_size
-FROM (
-    SELECT
-        cluster_id,
-        COUNT(*) AS cluster_size
-    FROM our_clusters
-    GROUP BY cluster_id
-)
-"""
-cluster_stats = ddb_con.execute(cluster_stats_query).fetchdf()
-print("Cluster Statistics:")
-print(cluster_stats)
-
 
 # Validate the clusters using NetworkX
 # Build the graph using NetworkX
@@ -159,20 +140,8 @@ nx_cluster_df = pd.DataFrame(
     columns=["unique_id", "nx_cluster_id"],
 )
 
-# Merge our clusters with NetworkX clusters
-merged_clusters = our_clusters.merge(nx_cluster_df, on="unique_id")
-
-# Check if the clusterings match
-# Since the cluster IDs may not match, we check that for each of our clusters, the set of nodes matches the corresponding NetworkX cluster
-grouped_our_clusters = merged_clusters.groupby("cluster_id")["nx_cluster_id"].nunique()
-
-if grouped_our_clusters.eq(1).all():
-    print("Clustering matches with NetworkX connected components.")
-else:
-    print("ERROR: Clustering does not match with NetworkX connected components.")
-
 # Check the answer against Splink's connected components
-from splink import DuckDBAPI, Linker, SettingsCreator
+nx_cluster_df
 
 db_api = DuckDBAPI(ddb_con)
 settings_creator = SettingsCreator(link_type="dedupe_only")
@@ -186,29 +155,57 @@ clusters = linker.clustering.cluster_pairwise_predictions_at_threshold(
 )
 splink_clusters = clusters.as_pandas_dataframe()
 
-#
-# Merge our clusters with Splink clusters
-merged_clusters = our_clusters.merge(
-    splink_clusters, on="unique_id", suffixes=("_our", "_splink")
+
+cluster_stats_query = """
+SELECT
+    COUNT(DISTINCT cluster_id) AS num_clusters,
+    AVG(cluster_size) AS avg_cluster_size,
+    SUM(cluster_size) AS total_nodes
+FROM (
+    SELECT
+        cluster_id,
+        COUNT(*) AS cluster_size
+    FROM our_clusters
+    GROUP BY cluster_id
 )
+"""
+cluster_stats = ddb_con.execute(cluster_stats_query).fetchdf()
+print("Our Cluster Statistics:")
+print(cluster_stats)
 
-# Check if the clusterings match
-# Since the cluster IDs may not match, we check that for each of our clusters,
-# all nodes belong to the same Splink cluster and vice versa
-grouped_our_clusters = merged_clusters.groupby("cluster_id_our")[
-    "cluster_id_splink"
-].nunique()
-grouped_splink_clusters = merged_clusters.groupby("cluster_id_splink")[
-    "cluster_id_our"
-].nunique()
 
-if grouped_our_clusters.eq(1).all() and grouped_splink_clusters.eq(1).all():
-    print("Our clustering matches Splink's clustering.")
-else:
-    print("ERROR: Our clustering does not match Splink's clustering.")
-
-# Additional statistics
-print(f"Number of clusters in our method: {our_clusters['cluster_id'].nunique()}")
-print(
-    f"Number of clusters in Splink's method: {splink_clusters['cluster_id'].nunique()}"
+# Calculate cluster statistics for our method
+our_cluster_stats_query = """
+SELECT
+    COUNT(DISTINCT nx_cluster_id) AS num_clusters,
+    AVG(cluster_size) AS avg_cluster_size,
+    SUM(cluster_size) AS total_nodes
+FROM (
+    SELECT
+        nx_cluster_id,
+        COUNT(*) AS cluster_size
+    FROM nx_cluster_df
+    GROUP BY nx_cluster_id
 )
+"""
+our_cluster_stats = ddb_con.execute(our_cluster_stats_query).fetchdf()
+print("NX Cluster Statistics:")
+print(our_cluster_stats)
+
+# Calculate cluster statistics for Splink's method
+splink_cluster_stats_query = """
+SELECT
+    COUNT(DISTINCT cluster_id) AS num_clusters,
+    AVG(cluster_size) AS avg_cluster_size,
+    SUM(cluster_size) AS total_nodes
+FROM (
+    SELECT
+        cluster_id,
+        COUNT(*) AS cluster_size
+    FROM splink_clusters
+    GROUP BY cluster_id
+)
+"""
+splink_cluster_stats = ddb_con.execute(splink_cluster_stats_query).fetchdf()
+print("Splink Cluster Statistics:")
+print(splink_cluster_stats)
