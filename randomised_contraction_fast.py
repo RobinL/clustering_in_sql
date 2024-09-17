@@ -41,9 +41,12 @@ duckdb.execute(sql)
 # Delete the function if it exists, then recreate it
 
 try:
-    duckdb.create_function(
-        "axb", lambda a, x, b: (a * x + b) % (2**64), return_type="UBIGINT"
-    )
+    sql = """
+    CREATE OR REPLACE MACRO axb(a, x, b) AS (
+        cast((cast(a as ubigint) * cast(x as ubigint) + cast(b as ubigint)) % 2**32 as ubigint)
+    );
+    """
+    duckdb.execute(sql)
 except Exception as e:
     print(f"Error creating function: {e}")
     pass
@@ -55,14 +58,14 @@ rowcount = 1
 
 while rowcount > 0:
     i += 1
-    A = random.randint(1, 2**63 - 1)  # Ensuring A != 0
-    B = random.randint(0, 2**64 - 1)
+    A = random.randint(1, 2**31 - 1)  # Ensuring A != 0
+    B = random.randint(0, 2**32 - 1)
     S.append((A, B))
 
     # Compute representatives
     create_representatives_query = f"""
     CREATE OR REPLACE TABLE R{i} AS
-    SELECT v, LEAST(axb({A}, v, {B}), MIN(axb({A}, w, {B}))) AS r
+    SELECT v, LEAST(axb({A}::bigint, v, {B}::bigint), MIN(axb({A}::bigint, w, {B}::bigint))) AS r
     FROM E
     GROUP BY v
     """
@@ -93,15 +96,16 @@ while i > 1:
     i -= 1
     alpha, beta = S.pop()
     A, B = duckdb.execute(
-        f"SELECT axb({A}, {alpha}, 0), axb({A}, {beta}, {B})"
+        f"SELECT axb({A}::bigint, {alpha}::bigint, 0), axb({A}::bigint, {beta}::bigint, {B}::bigint)"
     ).fetchone()
 
     compose_query = f"""
     CREATE OR REPLACE TABLE T AS
-    SELECT L.v, COALESCE(R.r, axb({A}, L.r, {B})) AS r
+    SELECT L.v, COALESCE(R.r, axb({A}::bigint, L.r, {B}::bigint)) AS r
     FROM R{i} AS L
     LEFT OUTER JOIN R{i+1} AS R ON (L.r = R.v)
     """
+
     duckdb.execute(compose_query)
 
     duckdb.execute(f"DROP TABLE R{i}")
